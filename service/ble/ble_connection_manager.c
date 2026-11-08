@@ -1224,7 +1224,6 @@ static void process_bond_event(ble_gap_bond_ind_t *ind, uint16_t command)
         g_conn_manager[manager_index].enc_state = ENC_STATE_ON;
         g_conn_manager[manager_index].first_bond = 1;
 
-        LOG_HEX("LTK", 16, ind->data.ltk.ltk.key, GAP_KEY_LEN);
 #ifdef BLE_CTKD_ENABLE
         if (g_conn_manager[manager_index].sec_con_enabled &&
                 connection_manager_ctkd_raw_ltk_get(ind->conn_idx, &g_bonding_info.raw_ltk))
@@ -3134,7 +3133,6 @@ static void cm_cmd(uint8_t argc, char **argv)
             {
                 LOG_I("bonded dev %d", g_bond_info.priority[i]);
                 LOG_HEX("addr", 16, g_bond_info.peer_addr[i].addr.addr, BD_ADDR_LEN);
-                LOG_HEX("ltk", 16, g_bond_info.ltk[i].ltk.key, GAP_KEY_LEN);
             }
 #endif //BLE_CM_BOND_DISABLE
         }

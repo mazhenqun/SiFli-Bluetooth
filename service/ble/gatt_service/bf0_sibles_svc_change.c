@@ -243,7 +243,13 @@ int service_changed_ble_handler(uint16_t event_id, uint8_t *data, uint16_t len, 
             break;
         }
 
-        if (rsp->result != HL_ERR_NO_ERROR)
+        if (rsp->search_svc_len != sizeof(generic_attribute_uuid) ||
+                memcmp(rsp->search_uuid, generic_attribute_uuid, sizeof(generic_attribute_uuid)) != 0)
+        {
+            break;
+        }
+
+        if (rsp->result != HL_ERR_NO_ERROR || !rsp->svc)
         {
             env->state = SVC_CHANGE_STATE_IDLE;
             break;
@@ -257,13 +263,15 @@ int service_changed_ble_handler(uint16_t event_id, uint8_t *data, uint16_t len, 
             uint8_t find = 0;
             for (int i = 0; i < rsp->svc->char_count; i++)
             {
-                if (memcmp(chara->uuid, svc_changed_uuid, chara->uuid_len) == 0)
+                if (chara->uuid_len == sizeof(svc_changed_uuid) &&
+                        memcmp(chara->uuid, svc_changed_uuid, sizeof(svc_changed_uuid)) == 0)
                 {
-                    LOG_I("noti_uuid received, att handle(%x), des handle(%x)", chara->attr_hdl, chara->desc[0].attr_hdl);
                     env->cccd_hdl = sibles_descriptor_handle_find(chara, ATT_DESC_CLIENT_CHAR_CFG);
-                    find = 1;
+                    find = env->cccd_hdl != 0;
                     break;
                 }
+                chara = (void *)((uint8_t *)chara + sizeof(*chara) +
+                                 chara->desc_count * sizeof(chara->desc[0]));
             }
 
             if (find == 0)

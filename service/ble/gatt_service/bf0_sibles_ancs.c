@@ -66,8 +66,8 @@ typedef struct
 
 typedef struct
 {
-    uint8_t hdl_start;
-    uint8_t hdl_end;
+    uint16_t hdl_start;
+    uint16_t hdl_end;
 } ble_ancs_svc_t;
 
 typedef struct
@@ -220,73 +220,88 @@ static void ble_ancs_parser_notification_source(uint8_t *data, ble_ancs_noti_att
     memcpy(&header->noti_uid, data, sizeof(uint32_t));
 }
 
-// estimate value
-#define MAX_ANCS_ATTRIBUTE_OTHER_TOTAL_LENGTH 50
+#define MAX_ANCS_ATTRIBUTE_OTHER_TOTAL_LENGTH 512
 
-static uint16_t ble_ancs_get_maximum_attribute_len(void)
+static uint32_t ble_ancs_get_maximum_attribute_len(void)
 {
     ble_ancs_env_t *env = ble_ancs_get_env();
     // The 3 type length is set by user
-    uint16_t len = env->noti_attr_list[BLE_ANCS_NOTIFICATION_ATTR_ID_TITLE].len +
+    uint32_t len = env->noti_attr_list[BLE_ANCS_NOTIFICATION_ATTR_ID_TITLE].len +
                    env->noti_attr_list[BLE_ANCS_NOTIFICATION_ATTR_ID_SUB_TITLE].len +
                    env->noti_attr_list[BLE_ANCS_NOTIFICATION_ATTR_ID_MESSAGE].len;
     len += MAX_ANCS_ATTRIBUTE_OTHER_TOTAL_LENGTH;
-    return len;
+    return len < UINT16_MAX ? len : UINT16_MAX;
+}
+
+static void ble_ancs_clear_fragment(ble_ancs_env_t *env)
+{
+    if (env->frag_ptr)
+        bt_mem_free(env->frag_ptr);
+    env->frag_ptr = NULL;
+    env->is_fragment = 0;
+    env->frag_offset = 0;
 }
 
 static void ble_ancs_parser_get_noti_attr_rsp(ble_ancs_get_noti_attr_rsp_t *data, uint16_t data_len)
 {
-    ble_ancs_noti_attr_queue_t *noti = ble_ancs_find_noti_buffer_by_uuid(data->noti_uid);
     ble_ancs_env_t *env = ble_ancs_get_env();
-    OS_ASSERT(data);
-    if (noti == NULL)
+    ble_ancs_noti_attr_queue_t *noti = NULL;
+    uint16_t pos = sizeof(*data);
+    uint8_t expected = 0, received = 0, count = 0;
+    if (data_len < pos)
+        goto fragment;
+    noti = ble_ancs_find_noti_buffer_by_uuid(data->noti_uid);
+    if (!noti)
+        goto discard;
+    for (unsigned i = 0; i < BLE_ANCS_NOTI_ATTR_NUMBER; ++i)
+        if (env->noti_attr_list[i].enable)
+            expected |= 1u << i;
+
+    /* A packet can end exactly between TLVs, even with no partial TLV. */
+    while (received != expected)
     {
-        LOG_W("ancs noti buffer not found, uid %d", data->noti_uid);
-        return;
+        if (data_len - pos < (int)sizeof(ble_ancs_attr_value_t))
+            goto fragment;
+        const ble_ancs_attr_value_t *value = (const void *)((uint8_t *)data + pos);
+        if (value->attr_id >= BLE_ANCS_NOTI_ATTR_NUMBER)
+            goto discard;
+        uint8_t bit = 1u << value->attr_id;
+        if (!(expected & bit) || (received & bit))
+            goto discard;
+        pos += sizeof(*value);
+        if (value->len > data_len - pos)
+            goto fragment;
+        pos += value->len;
+        received |= bit;
+        ++count;
     }
-    uint16_t len = data_len - sizeof(ble_ancs_get_noti_attr_rsp_t);
-    ble_ancs_attr_value_t *attr_value = data->value;
-    while (len)
+    if (pos != data_len)
+        goto discard;
+    noti->src.attr_count = count;
+    noti->src.value = data->value;
+    ble_event_publish(BLE_ANCS_NOTIFICATION_IND, &noti->src, sizeof(noti->src));
+    goto discard;
+
+fragment:
+    if (data_len < ble_ancs_get_maximum_attribute_len())
     {
-        // If len smaller than attribute len, just ignore. This case happen when ANCS assemble length set larger than GATT MTU set.
-        if (len < (attr_value->len + sizeof(ble_ancs_attr_value_t)))
+        if (!env->frag_ptr)
         {
-            // Wait completed data and parse again.
-            if (env->is_fragment == 0)
-            {
-                uint16_t att_len  = ble_ancs_get_maximum_attribute_len();
-                env->is_fragment = 1;
-                env->frag_ptr = bt_mem_alloc(att_len);
-                env->frag_offset = 0;
-                BT_OOM_ASSERT(env->frag_ptr);
-                if (env->frag_ptr)
-                    memcpy(env->frag_ptr, data, data_len);
-            }
-            // The data len already include
+            env->frag_ptr = bt_mem_alloc(ble_ancs_get_maximum_attribute_len());
+            if (env->frag_ptr)
+                memcpy(env->frag_ptr, data, data_len);
+        }
+        if (env->frag_ptr)
+        {
+            env->is_fragment = 1;
             env->frag_offset = data_len;
-            noti->src.attr_count = 0;
             return;
         }
-        len -= attr_value->len + sizeof(ble_ancs_attr_value_t);
-        LOG_HEX("ancs_attr", 16, (uint8_t *)attr_value, attr_value->len + sizeof(ble_ancs_attr_value_t));
-        attr_value = (ble_ancs_attr_value_t *)((uint8_t *)attr_value + sizeof(ble_ancs_attr_value_t) + attr_value->len);
-        noti->src.attr_count++;
     }
-    if (env->is_fragment)
-        noti->src.value = ((ble_ancs_get_noti_attr_rsp_t *)env->frag_ptr)->value;
-    else
-        noti->src.value = data->value;
-    // Notify user
-    ble_event_publish(BLE_ANCS_NOTIFICATION_IND, &noti->src, sizeof(ble_ancs_noti_attr_t));
-    // clear buffer
-    if (env->is_fragment)
-    {
-        env->is_fragment = 0;
-        bt_mem_free(env->frag_ptr);
-        env->frag_ptr = NULL;
-        env->frag_offset = 0;
-    }
-    memset(noti, 0, sizeof(ble_ancs_noti_attr_queue_t));
+discard:
+    if (noti)
+        memset(noti, 0, sizeof(*noti));
+    ble_ancs_clear_fragment(env);
 }
 
 // APP ATTR need cache during a session so that need upper layer to trigger to acquire.
@@ -319,7 +334,8 @@ static void ble_ancs_parser_get_app_attr_rsp(uint8_t *data, uint16_t data_len)
 
 static void ble_ancs_parser_data_source(uint8_t *data, uint16_t data_len)
 {
-    OS_ASSERT(data);
+    if (!data || !data_len)
+        return;
     uint8_t command_id = *data;
     if (command_id == BLE_ANCS_COMMAND_ID_GET_NOTIFICATION_ATTR)
     {
@@ -453,7 +469,7 @@ static int8_t ble_ancs_enable_cccd(ble_ancs_env_t *env, uint8_t is_enable)
     value.len = 2;
     value.value = (uint8_t *)&enable;
     ret2 = sibles_write_remote_value(env->remote_handle, env->conn_idx, &value);
-    return ret1 & ret2;
+    return ret1 != SIBLES_WRITE_NO_ERR ? ret1 : ret2;
 }
 
 static void ble_ancs_disconnect_handler(ble_ancs_env_t *env)
@@ -466,13 +482,7 @@ static void ble_ancs_disconnect_handler(ble_ancs_env_t *env)
     // step3: reset env
     env->conn_idx = INVALID_CONN_IDX;
     env->state = BLE_ANCS_STATE_IDLE;
-    if (env->is_fragment)
-    {
-        env->is_fragment = 0;
-        bt_mem_free(env->frag_ptr);
-        env->frag_ptr = NULL;
-        env->frag_offset = 0;
-    }
+    ble_ancs_clear_fragment(env);
 }
 
 int32_t ble_ancs_get_app_attr(uint8_t *app_id, uint8_t app_id_len)
@@ -532,7 +542,7 @@ static void ble_ancs_notification_source_notify_handler(uint8_t *data)
         return; // No buffer to handle
     ble_ancs_parser_notification_source(data, &header->src);
 
-    if (!((1 << header->src.cate_id) & env->cate_mask))
+    if (header->src.cate_id >= 16 || !((1u << header->src.cate_id) & env->cate_mask))
     {
         return; // No need handle this type.
     }
@@ -595,7 +605,8 @@ uint8_t ble_ancs_cccd_enable(uint8_t is_enable)
     {
         env->is_cccd_on = is_enable;
         res = ble_ancs_enable_cccd(env, is_enable);
-        OS_ASSERT(res == SIBLES_WRITE_NO_ERR);
+        if (res != SIBLES_WRITE_NO_ERR)
+            ret = BLE_ANCS_ERR_REJECTED;
     }
     else if (env->state <= BLE_ANCS_STATE_SEARCH_COMPLETED)
     {
@@ -634,6 +645,8 @@ static int ble_ancs_gattc_event_handler(uint16_t event_id, uint8_t *data, uint16
     {
         ble_ancs_enable_rsp_t enable_rsp;
         sibles_register_remote_svc_rsp_t *rsp = (sibles_register_remote_svc_rsp_t *)data;
+        if (rsp->conn_idx != env->conn_idx || env->state != BLE_ANCS_STATE_SEARCHING)
+            break;
         enable_rsp.conn_idx = rsp->conn_idx;
         LOG_I("register ret %d\r\n", rsp->status);
         if (rsp->status != HL_ERR_NO_ERROR)
@@ -648,7 +661,14 @@ static int ble_ancs_gattc_event_handler(uint16_t event_id, uint8_t *data, uint16
         if (env->is_cccd_on)
         {
             res = ble_ancs_enable_cccd(env, env->is_cccd_on);
-            OS_ASSERT(res == SIBLES_WRITE_NO_ERR);
+            if (res != SIBLES_WRITE_NO_ERR)
+            {
+                ble_ancs_disconnect_handler(env);
+                env->conn_idx = rsp->conn_idx;
+                enable_rsp.result = BLE_ANCS_ERR_REJECTED;
+                ble_event_publish(BLE_ANCS_ENABLE_RSP, &enable_rsp, sizeof(enable_rsp));
+                break;
+            }
         }
 
         enable_rsp.result = BLE_ANCS_ERR_NO_ERR;
@@ -665,20 +685,27 @@ static int ble_ancs_gattc_event_handler(uint16_t event_id, uint8_t *data, uint16
         }
 
         sibles_remote_event_ind_t *ind = (sibles_remote_event_ind_t *)data;
+        if (ind->conn_idx != env->conn_idx)
+            break;
         //LOG_I("ancs handle:%d", ind->handle);
         if (ind->handle == env->noti_src_char.value_hdl)
         {
-            ble_ancs_notification_source_notify_handler(ind->value);
+            if (ind->length == 8)
+                ble_ancs_notification_source_notify_handler(ind->value);
         }
         else if (ind->handle == env->data_src_char.value_hdl)
         {
             if (env->is_fragment)
             {
-                OS_ASSERT(env->frag_ptr && "Fragment ptr should not be NULL!");
-                // if this assert happened,try to increase length when calling ble_ancs_attr_enable
-                OS_ASSERT((env->frag_offset + ind->length) <= ble_ancs_get_maximum_attribute_len());
+                uint32_t total = (uint32_t)env->frag_offset + ind->length;
+                if (total > ble_ancs_get_maximum_attribute_len())
+                {
+                    ble_ancs_clear_fragment(env);
+                    ble_ancs_clear_noti_buffer();
+                    break;
+                }
                 memcpy(env->frag_ptr + env->frag_offset, ind->value, ind->length);
-                ble_ancs_parser_data_source(env->frag_ptr, env->frag_offset + ind->length);
+                ble_ancs_parser_data_source(env->frag_ptr, total);
             }
             else
                 ble_ancs_parser_data_source(ind->value, ind->length);
@@ -703,10 +730,12 @@ int ble_ancs_ble_event_handler(uint16_t event_id, uint8_t *data, uint16_t len, u
         sibles_svc_search_rsp_t *rsp = (sibles_svc_search_rsp_t *)data;
 
         // rsp->svc may null
-        if (memcmp(rsp->search_uuid, ancs_service_uuid, rsp->search_svc_len) != 0)
+        if (rsp->conn_idx != env->conn_idx || env->state != BLE_ANCS_STATE_SEARCHING ||
+                rsp->search_svc_len != sizeof(ancs_service_uuid) ||
+                memcmp(rsp->search_uuid, ancs_service_uuid, sizeof(ancs_service_uuid)) != 0)
             break;
 
-        if (rsp->result != HL_ERR_NO_ERROR)
+        if (rsp->result != HL_ERR_NO_ERROR || !rsp->svc)
         {
             ble_ancs_enable_rsp_t enable_rsp;
             enable_rsp.conn_idx = rsp->conn_idx;
@@ -716,6 +745,7 @@ int ble_ancs_ble_event_handler(uint16_t event_id, uint8_t *data, uint16_t len, u
             break; // Do nothing
         }
 
+        env->controlp_char.value_hdl = 0;
         env->svc.hdl_start = rsp->svc->hdl_start;
         env->svc.hdl_end = rsp->svc->hdl_end;
         uint32_t i;
@@ -725,9 +755,10 @@ int ble_ancs_ble_event_handler(uint16_t event_id, uint8_t *data, uint16_t len, u
         sibles_svc_search_char_t *chara = (sibles_svc_search_char_t *)rsp->svc->att_db;
         for (i = 0; i < rsp->svc->char_count; i++)
         {
-            if (!memcmp(chara->uuid, ancs_noti_src_uuid, chara->uuid_len))
+            if (chara->uuid_len == sizeof(ancs_noti_src_uuid) &&
+                    !memcmp(chara->uuid, ancs_noti_src_uuid, sizeof(ancs_noti_src_uuid)))
             {
-                LOG_I("noti_uuid received, att handle(%x), des handle(%x)", chara->attr_hdl, chara->desc[0].attr_hdl);
+                LOG_I("noti_uuid received, att handle(%x)", chara->attr_hdl);
                 env->noti_src_char.attr_hdl = chara->attr_hdl;
                 env->noti_src_char.value_hdl = chara->pointer_hdl;
                 env->noti_src_char.prop = chara->prop;
@@ -738,16 +769,18 @@ int ble_ancs_ble_event_handler(uint16_t event_id, uint8_t *data, uint16_t len, u
                     noti_src_check = 1;
                 }
             }
-            else if (!memcmp(chara->uuid, ancs_controlp_uuid, chara->uuid_len))
+            else if (chara->uuid_len == sizeof(ancs_controlp_uuid) &&
+                     !memcmp(chara->uuid, ancs_controlp_uuid, sizeof(ancs_controlp_uuid)))
             {
                 LOG_I("control received, att handle(%x)", chara->attr_hdl);
                 env->controlp_char.attr_hdl = chara->attr_hdl;
                 env->controlp_char.value_hdl = chara->pointer_hdl;
                 env->controlp_char.prop = chara->prop;
             }
-            else if (!memcmp(chara->uuid, ancs_data_src_uuid, chara->uuid_len))
+            else if (chara->uuid_len == sizeof(ancs_data_src_uuid) &&
+                     !memcmp(chara->uuid, ancs_data_src_uuid, sizeof(ancs_data_src_uuid)))
             {
-                LOG_I("data src received, att handle(%x), des handle(%x)", chara->attr_hdl, chara->desc[0].attr_hdl);
+                LOG_I("data src received, att handle(%x)", chara->attr_hdl);
                 env->data_src_char.attr_hdl = chara->attr_hdl;
                 env->data_src_char.value_hdl = chara->pointer_hdl;
                 env->data_src_char.prop = chara->prop;
@@ -761,7 +794,7 @@ int ble_ancs_ble_event_handler(uint16_t event_id, uint8_t *data, uint16_t len, u
             offset = sizeof(sibles_svc_search_char_t) + chara->desc_count * sizeof(struct sibles_disc_char_desc_ind);
             chara = (sibles_svc_search_char_t *)((uint8_t *)chara + offset);
         }
-        if (noti_src_check != 1 || data_src_check != 1)
+        if (!noti_src_check || !data_src_check || !env->controlp_char.value_hdl)
         {
             ble_ancs_enable_rsp_t enable_rsp;
             enable_rsp.conn_idx = rsp->conn_idx;
@@ -772,6 +805,12 @@ int ble_ancs_ble_event_handler(uint16_t event_id, uint8_t *data, uint16_t len, u
         }
         //register first
         env->remote_handle = sibles_register_remote_svc(rsp->conn_idx, env->svc.hdl_start, env->svc.hdl_end, ble_ancs_gattc_event_handler);
+        if (env->remote_handle == SIBLES_ERROR_REMOTE_HANDLE)
+        {
+            ble_ancs_enable_rsp_t enable_rsp = {rsp->conn_idx, BLE_ANCS_ERR_REGISTER_REMOTE_DEVICE_FAILED};
+            env->state = BLE_ANCS_STATE_IDLE;
+            ble_event_publish(BLE_ANCS_ENABLE_RSP, &enable_rsp, sizeof(enable_rsp));
+        }
         // subscribe data src. then subscribe notfi src.
         break;
     }
@@ -803,7 +842,8 @@ int ble_ancs_ble_event_handler(uint16_t event_id, uint8_t *data, uint16_t len, u
         {
             if (env->state == BLE_ANCS_STATE_READY || env->state == BLE_ANCS_STATE_IDLE)
             {
-                if (ind->start_handle <= env->svc.hdl_start && ind->end_handle >= env->svc.hdl_end)
+                if (env->state == BLE_ANCS_STATE_IDLE ||
+                        (ind->start_handle <= env->svc.hdl_end && ind->end_handle >= env->svc.hdl_start))
                 {
                     LOG_I("update");
                     if (env->state == BLE_ANCS_STATE_READY)
